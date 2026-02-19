@@ -1,4 +1,5 @@
 import { createServiceClient } from "@/lib/supabase/server";
+import IngestButton from "./IngestButton";
 
 const BAND_COLORS: Record<string, string> = {
   HOT: "bg-red-100 text-red-800 border-red-200",
@@ -49,6 +50,8 @@ export default async function Dashboard() {
   return (
     <div>
       <h1 className="text-2xl font-bold mb-6">DRE Off Market Dashboard</h1>
+
+      <IngestButton />
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
