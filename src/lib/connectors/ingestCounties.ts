@@ -7,69 +7,13 @@ interface IngestResult {
   county: string;
   source: string;
   fetched: number;
-  created: number;
-  updated: number;
+  upserted: number;
   signals: number;
   contacts: number;
   errors: number;
 }
 
-async function upsertProperty(
-  supabase: SupabaseClient,
-  county: string,
-  parcelId: string | null,
-  addressRaw: string,
-  addressStd: string,
-  city?: string | null,
-  zip?: string | null
-): Promise<string | null> {
-  // Try to find existing
-  let existing;
-  if (parcelId) {
-    const { data } = await supabase
-      .from("properties")
-      .select("id")
-      .eq("county", county)
-      .eq("parcel_id", parcelId)
-      .limit(1);
-    existing = data?.[0];
-  }
-
-  if (!existing) {
-    const { data } = await supabase
-      .from("properties")
-      .select("id")
-      .eq("county", county)
-      .eq("address_std", addressStd)
-      .limit(1);
-    existing = data?.[0];
-  }
-
-  if (existing) {
-    await supabase
-      .from("properties")
-      .update({ source_last_seen_at: new Date().toISOString() })
-      .eq("id", existing.id);
-    return existing.id;
-  }
-
-  const { data: newProp, error } = await supabase
-    .from("properties")
-    .insert({
-      county,
-      parcel_id: parcelId,
-      address_raw: addressRaw,
-      address_std: addressStd,
-      city: city || null,
-      state: "MI",
-      zip: zip || null,
-    })
-    .select("id")
-    .single();
-
-  if (error) return null;
-  return newProp.id;
-}
+const BATCH_SIZE = 500;
 
 export async function ingestOakland(
   supabase: SupabaseClient
@@ -78,8 +22,7 @@ export async function ingestOakland(
     county: "OAKLAND",
     source: "arcgis",
     fetched: 0,
-    created: 0,
-    updated: 0,
+    upserted: 0,
     signals: 0,
     contacts: 0,
     errors: 0,
@@ -88,90 +31,82 @@ export async function ingestOakland(
   let parcels: OaklandParcel[];
   try {
     parcels = await fetchOaklandResidential();
-  } catch (err) {
+  } catch {
     result.errors++;
     return result;
   }
 
   result.fetched = parcels.length;
 
-  for (const p of parcels) {
-    try {
-      const { data: existing } = await supabase
-        .from("properties")
-        .select("id")
-        .eq("county", "OAKLAND")
-        .eq("parcel_id", p.parcel_id)
-        .limit(1);
+  // Batch upsert properties
+  for (let i = 0; i < parcels.length; i += BATCH_SIZE) {
+    const batch = parcels.slice(i, i + BATCH_SIZE);
 
-      if (existing && existing.length > 0) {
-        await supabase
-          .from("properties")
-          .update({ source_last_seen_at: new Date().toISOString() })
-          .eq("id", existing[0].id);
-        result.updated++;
+    const rows = batch.map((p) => ({
+      county: "OAKLAND" as const,
+      parcel_id: p.parcel_id,
+      address_raw: p.address_raw,
+      address_std: p.address_std,
+      city: p.city || null,
+      state: "MI",
+      zip: p.zip || null,
+      source_last_seen_at: new Date().toISOString(),
+    }));
 
-        // Upsert contact
-        await upsertContact(supabase, existing[0].id, p);
-      } else {
-        const { data: newProp, error } = await supabase
-          .from("properties")
-          .insert({
-            county: "OAKLAND",
-            parcel_id: p.parcel_id,
-            address_raw: p.address_raw,
-            address_std: p.address_std,
-            city: p.city,
-            state: "MI",
-            zip: p.zip,
-          })
-          .select("id")
-          .single();
+    const { error } = await supabase
+      .from("properties")
+      .upsert(rows, { onConflict: "county,parcel_id", ignoreDuplicates: false });
 
-        if (error || !newProp) {
-          result.errors++;
-          continue;
-        }
-        result.created++;
+    if (error) {
+      result.errors += batch.length;
+    } else {
+      result.upserted += batch.length;
+    }
+  }
 
-        await upsertContact(supabase, newProp.id, p);
-        result.contacts++;
-      }
-    } catch {
-      result.errors++;
+  // Batch upsert contacts — fetch property IDs for this batch
+  for (let i = 0; i < parcels.length; i += BATCH_SIZE) {
+    const batch = parcels.slice(i, i + BATCH_SIZE);
+    const parcelIds = batch.map((p) => p.parcel_id);
+
+    const { data: props } = await supabase
+      .from("properties")
+      .select("id, parcel_id")
+      .eq("county", "OAKLAND")
+      .in("parcel_id", parcelIds);
+
+    if (!props) continue;
+
+    const idMap = new Map(props.map((p) => [p.parcel_id, p.id]));
+
+    const contactRows = [];
+    for (const p of batch) {
+      const propId = idMap.get(p.parcel_id);
+      if (!propId || !p.owner_name) continue;
+      contactRows.push({
+        property_id: propId,
+        owner_name: p.owner_name,
+        mailing_address_raw: p.mailing_address || null,
+        mailing_address_std: p.mailing_address
+          ? normalizeAddress(p.mailing_address)
+          : null,
+        contact_source: "oakland_arcgis",
+        confidence: 60,
+      });
+    }
+
+    if (contactRows.length > 0) {
+      const { error } = await supabase
+        .from("owner_contacts")
+        .upsert(contactRows, {
+          onConflict: "property_id,contact_source",
+          ignoreDuplicates: true,
+        });
+      if (!error) result.contacts += contactRows.length;
     }
   }
 
   return result;
-}
-
-async function upsertContact(
-  supabase: SupabaseClient,
-  propertyId: string,
-  parcel: OaklandParcel
-): Promise<void> {
-  if (!parcel.owner_name) return;
-
-  // Check if contact already exists
-  const { data: existing } = await supabase
-    .from("owner_contacts")
-    .select("id")
-    .eq("property_id", propertyId)
-    .eq("contact_source", "oakland_arcgis")
-    .limit(1);
-
-  if (existing && existing.length > 0) return;
-
-  await supabase.from("owner_contacts").insert({
-    property_id: propertyId,
-    owner_name: parcel.owner_name,
-    mailing_address_raw: parcel.mailing_address,
-    mailing_address_std: parcel.mailing_address
-      ? normalizeAddress(parcel.mailing_address)
-      : null,
-    contact_source: "oakland_arcgis",
-    confidence: 60,
-  });
 }
 
 export async function ingestDelinquent(
@@ -182,8 +117,7 @@ export async function ingestDelinquent(
     county: county.toUpperCase(),
     source: "bsa_delinquent",
     fetched: 0,
-    created: 0,
-    updated: 0,
+    upserted: 0,
     signals: 0,
     contacts: 0,
     errors: 0,
@@ -199,67 +133,91 @@ export async function ingestDelinquent(
 
   result.fetched = records.length;
 
-  for (const rec of records) {
-    try {
-      const propertyId = await upsertProperty(
-        supabase,
-        rec.county,
-        rec.parcel_id,
-        rec.address_raw,
-        rec.address_std
-      );
+  // Batch upsert properties
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    const batch = records.slice(i, i + BATCH_SIZE);
 
-      if (!propertyId) {
-        result.errors++;
-        continue;
-      }
+    const rows = batch.map((rec) => ({
+      county: rec.county,
+      parcel_id: rec.parcel_id,
+      address_raw: rec.address_raw,
+      address_std: rec.address_std,
+      source_last_seen_at: new Date().toISOString(),
+    }));
 
-      // Check if we already have this signal
-      const { data: existingSignal } = await supabase
+    const { error } = await supabase
+      .from("properties")
+      .upsert(rows, { onConflict: "county,parcel_id", ignoreDuplicates: false });
+
+    if (error) {
+      result.errors += batch.length;
+    } else {
+      result.upserted += batch.length;
+    }
+  }
+
+  // Batch upsert tax signals + contacts
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    const batch = records.slice(i, i + BATCH_SIZE);
+    const parcelIds = batch.map((r) => r.parcel_id);
+
+    const { data: props } = await supabase
+      .from("properties")
+      .select("id, parcel_id")
+      .eq("county", county.toUpperCase())
+      .in("parcel_id", parcelIds);
+
+    if (!props) continue;
+
+    const idMap = new Map(props.map((p) => [p.parcel_id, p.id]));
+
+    // Tax signals
+    const signalRows = [];
+    for (const rec of batch) {
+      const propId = idMap.get(rec.parcel_id);
+      if (!propId) continue;
+      signalRows.push({
+        property_id: propId,
+        signal_type: "tax_delinquent_list",
+        tax_year: rec.tax_year,
+        amount_due: rec.amount_due,
+        source_name: "bsa_delinquent",
+        source_run_date: new Date().toISOString().split("T")[0],
+        raw_excerpt: rec.description,
+      });
+    }
+
+    if (signalRows.length > 0) {
+      const { error } = await supabase
         .from("tax_signals")
-        .select("id")
-        .eq("property_id", propertyId)
-        .eq("signal_type", "tax_delinquent_list")
-        .eq("source_name", "bsa_delinquent")
-        .limit(1);
-
-      if (!existingSignal || existingSignal.length === 0) {
-        await supabase.from("tax_signals").insert({
-          property_id: propertyId,
-          signal_type: "tax_delinquent_list",
-          tax_year: rec.tax_year,
-          amount_due: rec.amount_due,
-          source_name: "bsa_delinquent",
-          source_run_date: new Date().toISOString().split("T")[0],
-          raw_excerpt: rec.description,
+        .upsert(signalRows, {
+          onConflict: "property_id,signal_type,source_name",
+          ignoreDuplicates: false,
         });
-        result.signals++;
-        result.created++;
-      } else {
-        result.updated++;
-      }
+      if (!error) result.signals += signalRows.length;
+    }
 
-      // Add owner contact if available
-      if (rec.owner_name) {
-        const { data: existingContact } = await supabase
-          .from("owner_contacts")
-          .select("id")
-          .eq("property_id", propertyId)
-          .eq("contact_source", "bsa_delinquent")
-          .limit(1);
+    // Contacts
+    const contactRows = [];
+    for (const rec of batch) {
+      const propId = idMap.get(rec.parcel_id);
+      if (!propId || !rec.owner_name) continue;
+      contactRows.push({
+        property_id: propId,
+        owner_name: rec.owner_name,
+        contact_source: "bsa_delinquent",
+        confidence: 50,
+      });
+    }
 
-        if (!existingContact || existingContact.length === 0) {
-          await supabase.from("owner_contacts").insert({
-            property_id: propertyId,
-            owner_name: rec.owner_name,
-            contact_source: "bsa_delinquent",
-            confidence: 50,
-          });
-          result.contacts++;
-        }
-      }
-    } catch {
-      result.errors++;
+    if (contactRows.length > 0) {
+      const { error } = await supabase
+        .from("owner_contacts")
+        .upsert(contactRows, {
+          onConflict: "property_id,contact_source",
+          ignoreDuplicates: true,
+        });
+      if (!error) result.contacts += contactRows.length;
     }
   }
 
