@@ -1,5 +1,7 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { fetchOaklandResidential, OaklandParcel } from "./oaklandArcgis";
+import { fetchLivingstonResidential, LivingstonParcel } from "./livingstonArcgis";
+import { fetchLivingstonCityParcels, LivingstonCityParcel, SupportedCity } from "./livingstonCities";
 import { fetchDelinquentParcels, DelinquentRecord } from "./bsaDelinquent";
 import { normalizeAddress } from "@/lib/address";
 
@@ -14,6 +16,101 @@ interface IngestResult {
 }
 
 const BATCH_SIZE = 500;
+
+export async function ingestLivingston(
+  supabase: SupabaseClient
+): Promise<IngestResult> {
+  const result: IngestResult = {
+    county: "LIVINGSTON",
+    source: "arcgis",
+    fetched: 0,
+    upserted: 0,
+    signals: 0,
+    contacts: 0,
+    errors: 0,
+  };
+
+  let parcels: LivingstonParcel[];
+  try {
+    parcels = await fetchLivingstonResidential();
+  } catch (err) {
+    console.error("Livingston ArcGIS fetch failed:", err);
+    result.errors++;
+    return result;
+  }
+
+  result.fetched = parcels.length;
+
+  // Batch upsert properties
+  for (let i = 0; i < parcels.length; i += BATCH_SIZE) {
+    const batch = parcels.slice(i, i + BATCH_SIZE);
+
+    const rows = batch.map((p) => ({
+      county: "LIVINGSTON" as const,
+      parcel_id: p.parcel_id,
+      address_raw: p.address_raw,
+      address_std: p.address_std,
+      city: p.city || null,
+      state: "MI",
+      zip: p.zip || null,
+      source_last_seen_at: new Date().toISOString(),
+    }));
+
+    const { error } = await supabase
+      .from("properties")
+      .upsert(rows, { onConflict: "county,parcel_id", ignoreDuplicates: false });
+
+    if (error) {
+      result.errors += batch.length;
+    } else {
+      result.upserted += batch.length;
+    }
+  }
+
+  // Batch upsert contacts
+  for (let i = 0; i < parcels.length; i += BATCH_SIZE) {
+    const batch = parcels.slice(i, i + BATCH_SIZE);
+    const parcelIds = batch.map((p) => p.parcel_id);
+
+    const { data: props } = await supabase
+      .from("properties")
+      .select("id, parcel_id")
+      .eq("county", "LIVINGSTON")
+      .in("parcel_id", parcelIds);
+
+    if (!props) continue;
+
+    const idMap = new Map(props.map((p) => [p.parcel_id, p.id]));
+
+    const contactRows = [];
+    for (const p of batch) {
+      const propId = idMap.get(p.parcel_id);
+      if (!propId || !p.owner_name) continue;
+      contactRows.push({
+        property_id: propId,
+        owner_name: p.owner_name,
+        mailing_address_raw: p.mailing_address || null,
+        mailing_address_std: p.mailing_address
+          ? normalizeAddress(p.mailing_address)
+          : null,
+        contact_source: "livingston_arcgis",
+        confidence: 60,
+      });
+    }
+
+    if (contactRows.length > 0) {
+      const { error } = await supabase
+        .from("owner_contacts")
+        .upsert(contactRows, {
+          onConflict: "property_id,contact_source",
+          ignoreDuplicates: true,
+        });
+      if (!error) result.contacts += contactRows.length;
+    }
+  }
+
+  return result;
+}
 
 export async function ingestOakland(
   supabase: SupabaseClient
@@ -222,4 +319,110 @@ export async function ingestDelinquent(
   }
 
   return result;
+}
+
+async function ingestLivingstonCity(
+  supabase: SupabaseClient,
+  city: SupportedCity
+): Promise<IngestResult> {
+  const result: IngestResult = {
+    county: "LIVINGSTON",
+    source: `mcgi_${city.toLowerCase()}`,
+    fetched: 0,
+    upserted: 0,
+    signals: 0,
+    contacts: 0,
+    errors: 0,
+  };
+
+  let parcels: LivingstonCityParcel[];
+  try {
+    parcels = await fetchLivingstonCityParcels(city);
+  } catch (err) {
+    console.error(`Livingston city fetch failed (${city}):`, err);
+    result.errors++;
+    return result;
+  }
+
+  result.fetched = parcels.length;
+
+  for (let i = 0; i < parcels.length; i += BATCH_SIZE) {
+    const batch = parcels.slice(i, i + BATCH_SIZE);
+
+    const rows = batch.map((p) => ({
+      county: "LIVINGSTON" as const,
+      parcel_id: p.parcel_id,
+      address_raw: p.address_raw,
+      address_std: p.address_std,
+      city: p.city,
+      state: "MI",
+      zip: p.zip || null,
+      source_last_seen_at: new Date().toISOString(),
+    }));
+
+    const { error } = await supabase
+      .from("properties")
+      .upsert(rows, { onConflict: "county,parcel_id", ignoreDuplicates: false });
+
+    if (error) {
+      result.errors += batch.length;
+    } else {
+      result.upserted += batch.length;
+    }
+  }
+
+  for (let i = 0; i < parcels.length; i += BATCH_SIZE) {
+    const batch = parcels.slice(i, i + BATCH_SIZE);
+    const parcelIds = batch.map((p) => p.parcel_id);
+
+    const { data: props } = await supabase
+      .from("properties")
+      .select("id, parcel_id")
+      .eq("county", "LIVINGSTON")
+      .in("parcel_id", parcelIds);
+
+    if (!props) continue;
+
+    const idMap = new Map(props.map((p) => [p.parcel_id, p.id]));
+
+    const contactRows = [];
+    for (const p of batch) {
+      const propId = idMap.get(p.parcel_id);
+      if (!propId || !p.owner_name) continue;
+      contactRows.push({
+        property_id: propId,
+        owner_name: p.owner_name,
+        mailing_address_raw: p.mailing_address || null,
+        mailing_address_std: p.mailing_address
+          ? normalizeAddress(p.mailing_address)
+          : null,
+        contact_source: `mcgi_${city.toLowerCase()}`,
+        confidence: 60,
+      });
+    }
+
+    if (contactRows.length > 0) {
+      const { error } = await supabase
+        .from("owner_contacts")
+        .upsert(contactRows, {
+          onConflict: "property_id,contact_source",
+          ignoreDuplicates: true,
+        });
+      if (!error) result.contacts += contactRows.length;
+    }
+  }
+
+  return result;
+}
+
+export async function ingestHowell(
+  supabase: SupabaseClient
+): Promise<IngestResult> {
+  return ingestLivingstonCity(supabase, "HOWELL");
+}
+
+export async function ingestBrighton(
+  supabase: SupabaseClient
+): Promise<IngestResult> {
+  return ingestLivingstonCity(supabase, "BRIGHTON");
 }

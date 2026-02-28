@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
-import { ingestOakland, ingestDelinquent } from "@/lib/connectors/ingestCounties";
+import { ingestOakland, ingestLivingston, ingestDelinquent, ingestHowell, ingestBrighton } from "@/lib/connectors/ingestCounties";
 
 export const maxDuration = 300; // 5 min max for Vercel
 
@@ -13,15 +13,27 @@ export async function POST(req: NextRequest) {
   const supabase = createServiceClient();
   const results = [];
 
-  // 1. Oakland — ArcGIS parcels
+  // 1. LIVINGSTON — city-level via Michigan open parcel (no auth required)
   try {
-    const oakland = await ingestOakland(supabase);
-    results.push(oakland);
+    const howell = await ingestHowell(supabase);
+    results.push(howell);
   } catch (err) {
-    results.push({ county: "OAKLAND", error: String(err) });
+    results.push({ county: "LIVINGSTON", source: "mcgi_howell", error: String(err) });
+  }
+  try {
+    const brighton = await ingestBrighton(supabase);
+    results.push(brighton);
+  } catch (err) {
+    results.push({ county: "LIVINGSTON", source: "mcgi_brighton", error: String(err) });
+  }
+  try {
+    const livingstonDelinquent = await ingestDelinquent(supabase, "LIVINGSTON");
+    results.push(livingstonDelinquent);
+  } catch (err) {
+    results.push({ county: "LIVINGSTON", source: "bsa_delinquent", error: String(err) });
   }
 
-  // 2. Washtenaw — BS&A delinquent
+  // 2. Washtenaw — secondary
   try {
     const washtenaw = await ingestDelinquent(supabase, "WASHTENAW");
     results.push(washtenaw);
@@ -29,12 +41,12 @@ export async function POST(req: NextRequest) {
     results.push({ county: "WASHTENAW", error: String(err) });
   }
 
-  // 3. Livingston — BS&A delinquent
+  // 3. Oakland — secondary (large dataset, runs last)
   try {
-    const livingston = await ingestDelinquent(supabase, "LIVINGSTON");
-    results.push(livingston);
+    const oakland = await ingestOakland(supabase);
+    results.push(oakland);
   } catch (err) {
-    results.push({ county: "LIVINGSTON", error: String(err) });
+    results.push({ county: "OAKLAND", error: String(err) });
   }
 
   return NextResponse.json({ ok: true, results });
